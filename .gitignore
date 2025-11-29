@@ -29,7 +29,6 @@ env/
 ENV/
 
 data/*
-models/*
 
 # Ignore large model checkpoints
 # Keep the directory structure but ignore files inside
