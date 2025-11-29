@@ -1,0 +1,57 @@
+# --- Python Standard ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# --- Virtual Environments ---
+# Common names for virtual envs
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+data/*
+models/*
+
+# Ignore large model checkpoints
+# Keep the directory structure but ignore files inside
+!models/.gitkeep
+
+# Ignore generated results/plots
+results/*
+!results/.gitkeep
+
+# --- IDE & OS ---
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# VS Code
+.vscode/
+
+# PyCharm
+.idea/
+
+# --- Logs & Temporary Files ---
+*.log
+*.pot
+*.mo
