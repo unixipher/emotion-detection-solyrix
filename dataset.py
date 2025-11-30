@@ -5,7 +5,7 @@ import os
 import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-from preprocessing import load_and_preprocess_audio_enhanced as load_and_preprocess_audio
+from preprocessing import load_and_preprocess_audio
 from config import *
 
 
@@ -63,28 +63,45 @@ class EmotionDataset(Dataset):
         return len(self.samples)
     
     def __getitem__(self, idx):
+        """Get a single sample with error handling"""
         file_path, label = self.samples[idx]
         
-        try:
-            # Extract features
-            mel_spec, prosodic = load_and_preprocess_audio(file_path)
-            
-            # Convert to tensors
-            # Add channel dimension to mel_spec: (1, n_mels, time)
-            mel_spec = torch.FloatTensor(mel_spec).unsqueeze(0)
-            prosodic = torch.FloatTensor(prosodic)
-            label = torch.LongTensor([label])[0]
-            
-            # Apply transforms if any
-            if self.transform:
-                mel_spec = self.transform(mel_spec)
-            
-            return mel_spec, prosodic, label
-            
-        except Exception as e:
-            print(f"Error loading {file_path}: {e}")
-            # Return a random valid sample instead
-            return self.__getitem__((idx + 1) % len(self.samples))
+        max_retries = 10  # Try up to 10 different samples if one fails
+        for attempt in range(max_retries):
+            try:
+                # Extract features
+                mel_spec, prosodic = load_and_preprocess_audio(file_path)
+                
+                # Check if features are valid
+                if mel_spec is None or prosodic is None:
+                    raise ValueError("Invalid features returned")
+                
+                # Convert to tensors
+                # Add channel dimension to mel_spec: (1, n_mels, time)
+                mel_spec = torch.FloatTensor(mel_spec).unsqueeze(0)
+                prosodic = torch.FloatTensor(prosodic)
+                label_tensor = torch.LongTensor([label])[0]
+                
+                # Apply transforms if any
+                if self.transform:
+                    mel_spec = self.transform(mel_spec)
+                
+                return mel_spec, prosodic, label_tensor
+                
+            except Exception as e:
+                if attempt == 0:  # Only print error once
+                    print(f"Error loading {file_path}: {e}")
+                
+                # Try next sample in circular fashion
+                idx = (idx + 1) % len(self.samples)
+                file_path, label = self.samples[idx]
+        
+        # If all retries fail, return zeros (shouldn't happen often)
+        print(f"⚠️  Failed to load sample after {max_retries} attempts")
+        mel_spec = torch.zeros(1, N_MELS, 130)
+        prosodic = torch.zeros(13)
+        label_tensor = torch.LongTensor([0])[0]
+        return mel_spec, prosodic, label_tensor
 
 
 def create_data_loaders(data_dir, batch_size=BATCH_SIZE, train_split=0.8, random_seed=42):

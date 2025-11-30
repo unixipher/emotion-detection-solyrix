@@ -160,49 +160,116 @@ def extract_gammatone_spectrogram(audio, sr, n_bands=64):
         y=audio, sr=sr, n_mels=n_bands, hop_length=HOP_LENGTH
     )
     return librosa.power_to_db(mel_spec, ref=np.max)
+def extract_mel_spectrogram(audio, sr):
+    """Extract mel-spectrogram"""
+    mel_spec = librosa.feature.melspectrogram(
+        y=audio, 
+        sr=sr,
+        n_mels=N_MELS,
+        hop_length=HOP_LENGTH,
+        n_fft=2048
+    )
+    
+    # Convert to log scale (dB)
+    mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+    
+    return mel_spec_db
+
+def load_and_preprocess_audio(file_path, duration=DURATION, sr=SAMPLE_RATE):
+    """
+    Load and preprocess audio with robust error handling
+    """
+    try:
+        # Load audio
+        audio, _ = librosa.load(file_path, sr=sr, duration=duration)
+        
+        # Check if audio is valid
+        if len(audio) == 0:
+            raise ValueError("Empty audio file")
+        
+        # Pad or truncate to fixed length
+        target_length = sr * duration
+        if len(audio) < target_length:
+            audio = np.pad(audio, (0, target_length - len(audio)))
+        else:
+            audio = audio[:target_length]
+        
+        # Normalize audio
+        if np.max(np.abs(audio)) > 0:
+            audio = audio / np.max(np.abs(audio))
+        
+        # Extract features with error handling
+        mel_spec = extract_mel_spectrogram(audio, sr)
+        prosodic = extract_prosodic_features(audio, sr)
+        
+        # Validate feature shapes
+        if mel_spec.shape[0] != N_MELS:
+            raise ValueError(f"Invalid mel-spec shape: {mel_spec.shape}")
+        
+        if len(prosodic) != 13:  # Or whatever your prosodic dim is
+            raise ValueError(f"Invalid prosodic shape: {len(prosodic)}")
+        
+        return mel_spec, prosodic
+        
+    except Exception as e:
+        # Return None to signal error to dataset
+        print(f"Error in preprocessing {file_path}: {e}")
+        return None, None
 
 
-def load_and_preprocess_audio_enhanced(file_path, duration=DURATION, sr=SAMPLE_RATE):
-    """
-    Enhanced preprocessing with better features
-    """
-    # Load audio
-    audio, _ = librosa.load(file_path, sr=sr, duration=duration)
-    
-    # Pad or truncate
-    target_length = sr * duration
-    if len(audio) < target_length:
-        audio = np.pad(audio, (0, target_length - len(audio)))
-    else:
-        audio = audio[:target_length]
-    
-    # Normalize audio
-    if np.max(np.abs(audio)) > 0:
-        audio = audio / np.max(np.abs(audio))
-    
-    # Extract multi-resolution mel-spectrogram
-    mel_spec = extract_multi_resolution_mel(audio, sr)
-    
-    # Extract comprehensive prosodic features
-    prosodic = extract_enhanced_prosodic_features(audio, sr)
-    
-    # Add delta and delta-delta features (temporal dynamics)
-    # You can compute deltas of MFCC for better temporal modeling
-    mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13, hop_length=HOP_LENGTH)
-    mfcc_delta = librosa.feature.delta(mfcc)
-    mfcc_delta2 = librosa.feature.delta(mfcc, order=2)
-    
-    # Add temporal statistics to prosodic
-    temporal_features = np.array([
-        np.mean(mfcc_delta),
-        np.std(mfcc_delta),
-        np.mean(mfcc_delta2),
-        np.std(mfcc_delta2),
-    ])
-    
-    prosodic = np.concatenate([prosodic, temporal_features])
-    
-    return mel_spec, prosodic
+def extract_prosodic_features(audio, sr):
+    """Extract prosodic features with robust error handling"""
+    try:
+        # Pitch (F0) using YIN algorithm
+        f0 = librosa.yin(audio, fmin=librosa.note_to_hz('C2'), 
+                         fmax=librosa.note_to_hz('C7'), sr=sr)
+        
+        # Remove unvoiced frames
+        f0_voiced = f0[f0 > librosa.note_to_hz('C2')]
+        
+        if len(f0_voiced) > 0:
+            pitch_mean = np.mean(f0_voiced)
+            pitch_std = np.std(f0_voiced)
+            pitch_max = np.max(f0_voiced)
+            pitch_min = np.min(f0_voiced)
+        else:
+            pitch_mean = pitch_std = pitch_max = pitch_min = 0
+        
+        # Energy/Intensity
+        energy = librosa.feature.rms(y=audio, hop_length=HOP_LENGTH)[0]
+        energy_mean = np.mean(energy)
+        energy_std = np.std(energy)
+        energy_max = np.max(energy)
+        
+        # Zero Crossing Rate
+        zcr = librosa.feature.zero_crossing_rate(audio, hop_length=HOP_LENGTH)[0]
+        zcr_mean = np.mean(zcr)
+        zcr_std = np.std(zcr)
+        
+        # Spectral features
+        spectral_centroid = librosa.feature.spectral_centroid(y=audio, sr=sr, 
+                                                              hop_length=HOP_LENGTH)[0]
+        spectral_rolloff = librosa.feature.spectral_rolloff(y=audio, sr=sr, 
+                                                            hop_length=HOP_LENGTH)[0]
+        
+        # Combine all prosodic features
+        prosodic_features = np.array([
+            pitch_mean, pitch_std, pitch_max, pitch_min,
+            energy_mean, energy_std, energy_max,
+            zcr_mean, zcr_std,
+            np.mean(spectral_centroid), np.std(spectral_centroid),
+            np.mean(spectral_rolloff), np.std(spectral_rolloff)
+        ], dtype=np.float32)
+        
+        # Replace any NaN or Inf values with 0
+        prosodic_features = np.nan_to_num(prosodic_features, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        return prosodic_features
+        
+    except Exception as e:
+        print(f"Error extracting prosodic features: {e}")
+        # Return zeros if extraction fails
+        return np.zeros(13, dtype=np.float32)
 
 
 # Update config.py to handle variable prosodic feature size
