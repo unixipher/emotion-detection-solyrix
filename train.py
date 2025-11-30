@@ -1,119 +1,188 @@
 """
-Training script for Speech Emotion Recognition
+Advanced training techniques for higher accuracy
 """
-import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-from sklearn.metrics import classification_report, confusion_matrix
-import seaborn as sns
+from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingWarmRestarts
 import numpy as np
 
-from config import *
-from model import HybridEmotionModel
-from dataset import create_data_loaders
+
+class FocalLoss(nn.Module):
+    """Focal Loss for handling class imbalance better"""
+    def __init__(self, alpha=None, gamma=2, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        
+    def forward(self, inputs, targets):
+        ce_loss = nn.CrossEntropyLoss(reduction='none')(inputs, targets)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        
+        if self.alpha is not None:
+            alpha_t = self.alpha[targets]
+            focal_loss = alpha_t * focal_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        return focal_loss
 
 
-class Trainer:
-    def __init__(self, model, train_loader, val_loader, device, resume_path=None):
+class LabelSmoothingLoss(nn.Module):
+    """Label smoothing to prevent overconfidence"""
+    def __init__(self, classes, smoothing=0.1):
+        super().__init__()
+        self.confidence = 1.0 - smoothing
+        self.smoothing = smoothing
+        self.classes = classes
+        
+    def forward(self, pred, target):
+        pred = pred.log_softmax(dim=-1)
+        with torch.no_grad():
+            true_dist = torch.zeros_like(pred)
+            true_dist.fill_(self.smoothing / (self.classes - 1))
+            true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)
+        return torch.mean(torch.sum(-true_dist * pred, dim=-1))
+
+
+class MixUpAugmentation:
+    """MixUp data augmentation"""
+    def __init__(self, alpha=0.2):
+        self.alpha = alpha
+        
+    def __call__(self, x, y):
+        if self.alpha > 0:
+            lam = np.random.beta(self.alpha, self.alpha)
+        else:
+            lam = 1
+        
+        batch_size = x.size(0)
+        index = torch.randperm(batch_size).to(x.device)
+        
+        mixed_x = lam * x + (1 - lam) * x[index, :]
+        y_a, y_b = y, y[index]
+        
+        return mixed_x, y_a, y_b, lam
+
+
+class AdvancedTrainer:
+    """Enhanced trainer with modern techniques"""
+    
+    def __init__(self, model, train_loader, val_loader, device, config=None):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device
-        self.start_epoch = 0  # Default start
         
-        # --- NEW: CLASS WEIGHTING LOGIC ---
-        # Based on your dataset distribution:
-        # Happiness: ~12k (Base)
-        # Sadness: ~6k (2x rarer)
-        # Fear: ~3k (4x rarer)
-        # Anger: ~2k (6x rarer)
-        # Surprise: ~5k (2.4x rarer)
-        # Disgust: ~2k (6x rarer)
+        # Default config
+        self.config = config or {
+            'lr': 0.001,
+            'weight_decay': 1e-4,
+            'epochs': 150,
+            'use_focal_loss': True,
+            'use_label_smoothing': True,
+            'use_mixup': True,
+            'gradient_clip': 1.0,
+            'use_swa': True,  # Stochastic Weight Averaging
+        }
         
-        # Order must match config.py: ['happiness', 'sadness', 'fear', 'anger', 'surprise', 'disgust']
-        class_weights = [1.0, 2.0, 4.0, 6.0, 2.4, 6.0]
+        # Loss function
+        if self.config['use_focal_loss']:
+            # Class weights for focal loss
+            alpha = torch.FloatTensor([1.0, 2.0, 4.0, 6.0, 2.4, 6.0]).to(device)
+            self.criterion = FocalLoss(alpha=alpha, gamma=2)
+        elif self.config['use_label_smoothing']:
+            self.criterion = LabelSmoothingLoss(classes=6, smoothing=0.1)
+        else:
+            weights = torch.FloatTensor([1.0, 2.0, 4.0, 6.0, 2.4, 6.0]).to(device)
+            self.criterion = nn.CrossEntropyLoss(weight=weights)
         
-        # Convert to tensor and move to device
-        weights_tensor = torch.FloatTensor(class_weights).to(device)
-        print(f"⚖️  Using Class Weights: {class_weights}")
-        
-        # Apply weights to Loss function
-        self.criterion = nn.CrossEntropyLoss(weight=weights_tensor)
-        # ----------------------------------
-
-        self.optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.5, patience=5
+        # Optimizer with weight decay
+        self.optimizer = optim.AdamW(
+            model.parameters(),
+            lr=self.config['lr'],
+            weight_decay=self.config['weight_decay']
         )
         
-        # Training history
+        # Learning rate scheduler (OneCycle for better convergence)
+        self.scheduler = OneCycleLR(
+            self.optimizer,
+            max_lr=self.config['lr'] * 10,
+            epochs=self.config['epochs'],
+            steps_per_epoch=len(train_loader),
+            pct_start=0.3,
+            anneal_strategy='cos'
+        )
+        
+        # Alternative: Cosine Annealing with Warm Restarts
+        # self.scheduler = CosineAnnealingWarmRestarts(
+        #     self.optimizer, T_0=10, T_mult=2
+        # )
+        
+        # MixUp
+        self.mixup = MixUpAugmentation(alpha=0.2) if self.config['use_mixup'] else None
+        
+        # SWA (Stochastic Weight Averaging)
+        if self.config['use_swa']:
+            self.swa_model = optim.swa_utils.AveragedModel(model)
+            self.swa_scheduler = optim.swa_utils.SWALR(
+                self.optimizer, swa_lr=self.config['lr'] * 0.1
+            )
+            self.swa_start = self.config['epochs'] * 0.75  # Start SWA at 75% training
+        else:
+            self.swa_model = None
+        
+        self.best_val_acc = 0
         self.train_losses = []
         self.val_losses = []
         self.train_accs = []
         self.val_accs = []
-        self.best_val_loss = float('inf')
-        self.early_stopping_counter = 0
-
-        # Resume Logic
-        if resume_path and os.path.exists(resume_path):
-            print(f"Loading checkpoint from {resume_path}...")
-            checkpoint = torch.load(resume_path, map_location=device)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            
-            # Load history
-            self.train_losses = checkpoint.get('train_losses', [])
-            self.val_losses = checkpoint.get('val_losses', [])
-            self.train_accs = checkpoint.get('train_accs', [])
-            self.val_accs = checkpoint.get('val_accs', [])
-            
-            # Calculate start epoch based on history
-            self.start_epoch = len(self.train_losses)
-            if self.val_losses:
-                self.best_val_loss = min(self.val_losses)
-            
-            print(f"✓ Resuming from epoch {self.start_epoch + 1}")
-        
-        # Create directories
-        os.makedirs(MODEL_DIR, exist_ok=True)
-        os.makedirs(RESULTS_DIR, exist_ok=True)
     
-    def train_epoch(self):
-        """Train for one epoch"""
+    def train_epoch(self, epoch):
+        """Train one epoch with advanced techniques"""
         self.model.train()
         running_loss = 0.0
         correct = 0
         total = 0
         
-        pbar = tqdm(self.train_loader, desc='Training')
-        for mel_spec, prosodic, labels in pbar:
+        for batch_idx, (mel_spec, prosodic, labels) in enumerate(self.train_loader):
             mel_spec = mel_spec.to(self.device)
             prosodic = prosodic.to(self.device)
             labels = labels.to(self.device)
             
-            # Forward pass
-            self.optimizer.zero_grad()
-            outputs = self.model(mel_spec, prosodic)
-            loss = self.criterion(outputs, labels)
+            # MixUp augmentation
+            if self.mixup and np.random.random() > 0.5:
+                mel_spec, labels_a, labels_b, lam = self.mixup(mel_spec, labels)
+                
+                self.optimizer.zero_grad()
+                outputs = self.model(mel_spec, prosodic)
+                
+                loss = lam * self.criterion(outputs, labels_a) + \
+                       (1 - lam) * self.criterion(outputs, labels_b)
+            else:
+                self.optimizer.zero_grad()
+                outputs = self.model(mel_spec, prosodic)
+                loss = self.criterion(outputs, labels)
             
-            # Backward pass
+            # Backward pass with gradient clipping
             loss.backward()
+            
+            if self.config['gradient_clip']:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config['gradient_clip']
+                )
+            
             self.optimizer.step()
+            self.scheduler.step()
             
             # Statistics
             running_loss += loss.item()
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
-            
-            # Update progress bar
-            pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'acc': f'{100 * correct / total:.2f}%'
-            })
         
         epoch_loss = running_loss / len(self.train_loader)
         epoch_acc = 100 * correct / total
@@ -121,167 +190,112 @@ class Trainer:
         return epoch_loss, epoch_acc
     
     def validate(self):
-        """Validate the model"""
+        """Validation with TTA (Test Time Augmentation)"""
         self.model.eval()
         running_loss = 0.0
         correct = 0
         total = 0
-        all_preds = []
-        all_labels = []
         
         with torch.no_grad():
-            for mel_spec, prosodic, labels in tqdm(self.val_loader, desc='Validation'):
+            for mel_spec, prosodic, labels in self.val_loader:
                 mel_spec = mel_spec.to(self.device)
                 prosodic = prosodic.to(self.device)
                 labels = labels.to(self.device)
                 
+                # Regular prediction
                 outputs = self.model(mel_spec, prosodic)
+                loss = self.criterion(outputs, labels)
+                
+                # Optional: Test Time Augmentation (average multiple predictions)
+                # outputs_tta = []
+                # for _ in range(3):
+                #     # Add slight noise
+                #     mel_noisy = mel_spec + torch.randn_like(mel_spec) * 0.01
+                #     outputs_tta.append(self.model(mel_noisy, prosodic))
+                # outputs = torch.stack(outputs_tta).mean(dim=0)
+                
+                running_loss += loss.item()
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+        
+        epoch_loss = running_loss / len(self.val_loader)
+        epoch_acc = 100 * correct / total
+        
+        return epoch_loss, epoch_acc
+    
+    def train(self):
+        """Full training loop"""
+        print(f"Training Configuration:")
+        for key, value in self.config.items():
+            print(f"  {key}: {value}")
+        
+        for epoch in range(self.config['epochs']):
+            print(f"\nEpoch {epoch+1}/{self.config['epochs']}")
+            
+            train_loss, train_acc = self.train_epoch(epoch)
+            val_loss, val_acc = self.validate()
+            
+            self.train_losses.append(train_loss)
+            self.train_accs.append(train_acc)
+            self.val_losses.append(val_loss)
+            self.val_accs.append(val_acc)
+            
+            print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
+            print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+            print(f"LR: {self.optimizer.param_groups[0]['lr']:.6f}")
+            
+            # Update SWA model
+            if self.swa_model and epoch >= self.swa_start:
+                self.swa_model.update_parameters(self.model)
+                self.swa_scheduler.step()
+            
+            # Save best model
+            if val_acc > self.best_val_acc:
+                self.best_val_acc = val_acc
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'val_acc': val_acc,
+                }, 'models/best_model.pth')
+                print(f"✓ Best model saved! Val Acc: {val_acc:.2f}%")
+        
+        # Finalize SWA
+        if self.swa_model:
+            print("\nFinalizing SWA model...")
+            torch.optim.swa_utils.update_bn(self.train_loader, self.swa_model, self.device)
+            
+            # Validate SWA model
+            swa_val_loss, swa_val_acc = self.validate_swa()
+            print(f"SWA Val Acc: {swa_val_acc:.2f}%")
+            
+            if swa_val_acc > self.best_val_acc:
+                torch.save({
+                    'model_state_dict': self.swa_model.state_dict(),
+                    'val_acc': swa_val_acc,
+                }, 'models/best_swa_model.pth')
+                print("✓ SWA model is better! Saved.")
+    
+    def validate_swa(self):
+        """Validate SWA model"""
+        self.swa_model.eval()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for mel_spec, prosodic, labels in self.val_loader:
+                mel_spec = mel_spec.to(self.device)
+                prosodic = prosodic.to(self.device)
+                labels = labels.to(self.device)
+                
+                outputs = self.swa_model(mel_spec, prosodic)
                 loss = self.criterion(outputs, labels)
                 
                 running_loss += loss.item()
                 _, predicted = torch.max(outputs.data, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
-                
-                all_preds.extend(predicted.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
         
-        epoch_loss = running_loss / len(self.val_loader)
-        epoch_acc = 100 * correct / total
-        
-        return epoch_loss, epoch_acc, all_preds, all_labels
-    
-    def train(self, num_epochs=EPOCHS):
-        """Full training loop"""
-        print(f"\nStarting training on {self.device}")
-        print(f"Model parameters: {self.model.get_num_parameters():,}")
-        
-        for epoch in range(self.start_epoch, num_epochs):
-            print(f"\nEpoch {epoch+1}/{num_epochs}")
-            
-            # Train
-            train_loss, train_acc = self.train_epoch()
-            self.train_losses.append(train_loss)
-            self.train_accs.append(train_acc)
-            
-            # Validate
-            val_loss, val_acc, preds, labels = self.validate()
-            self.val_losses.append(val_loss)
-            self.val_accs.append(val_acc)
-            
-            # Learning rate scheduling
-            self.scheduler.step(val_loss)
-            
-            print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
-            print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
-            
-            # Save best model
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-                self.early_stopping_counter = 0
-                self.save_model('best_model.pth')
-                print("✓ Best model saved!")
-            else:
-                self.early_stopping_counter += 1
-            
-            # Early stopping
-            if self.early_stopping_counter >= EARLY_STOPPING_PATIENCE:
-                print(f"\nEarly stopping triggered after {epoch+1} epochs")
-                break
-        
-        # Save final results
-        self.save_training_plots()
-        self.save_confusion_matrix(preds, labels)
-        self.save_classification_report(preds, labels)
-        
-        print("\n✓ Training completed!")
-    
-    def save_model(self, filename):
-        """Save model checkpoint"""
-        filepath = os.path.join(MODEL_DIR, filename)
-        torch.save({
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'train_losses': self.train_losses,
-            'val_losses': self.val_losses,
-            'train_accs': self.train_accs,
-            'val_accs': self.val_accs,
-        }, filepath)
-    
-    def save_training_plots(self):
-        """Plot training history"""
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-        
-        # Loss plot
-        ax1.plot(self.train_losses, label='Train Loss')
-        ax1.plot(self.val_losses, label='Val Loss')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Loss')
-        ax1.set_title('Training and Validation Loss')
-        ax1.legend()
-        ax1.grid(True)
-        
-        # Accuracy plot
-        ax2.plot(self.train_accs, label='Train Acc')
-        ax2.plot(self.val_accs, label='Val Acc')
-        ax2.set_xlabel('Epoch')
-        ax2.set_ylabel('Accuracy (%)')
-        ax2.set_title('Training and Validation Accuracy')
-        ax2.legend()
-        ax2.grid(True)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(RESULTS_DIR, 'training_history.png'))
-        print(f"✓ Training plots saved to {RESULTS_DIR}/training_history.png")
-    
-    def save_confusion_matrix(self, preds, labels):
-        """Plot and save confusion matrix"""
-        cm = confusion_matrix(labels, preds)
-        
-        plt.figure(figsize=(10, 8))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                    xticklabels=EMOTIONS, yticklabels=EMOTIONS)
-        plt.title('Confusion Matrix')
-        plt.ylabel('True Label')
-        plt.xlabel('Predicted Label')
-        plt.tight_layout()
-        plt.savefig(os.path.join(RESULTS_DIR, 'confusion_matrix.png'))
-        print(f"✓ Confusion matrix saved to {RESULTS_DIR}/confusion_matrix.png")
-    
-    def save_classification_report(self, preds, labels):
-        """Save classification report"""
-        report = classification_report(labels, preds, target_names=EMOTIONS)
-        
-        with open(os.path.join(RESULTS_DIR, 'classification_report.txt'), 'w') as f:
-            f.write(report)
-        
-        print(f"✓ Classification report saved to {RESULTS_DIR}/classification_report.txt")
-        print("\nClassification Report:")
-        print(report)
-
-
-def main():
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"Using device: {device}")
-    
-    # Create data loaders
-    print("\nLoading data...")
-    train_loader, val_loader = create_data_loaders(DATA_DIR)
-    
-    # Create model
-    print("\nInitializing model...")
-    model = HybridEmotionModel()
-    
-    # Check if a model exists to resume from
-    resume_path = os.path.join(MODEL_DIR, 'best_model.pth')
-    if not os.path.exists(resume_path):
-        resume_path = None
-    
-    # Create trainer and train
-    trainer = Trainer(model, train_loader, val_loader, device, resume_path=resume_path)
-    trainer.train()
-
-
-if __name__ == "__main__":
-    main()
+        return running_loss / len(self.val_loader), 100 * correct / total
