@@ -5,7 +5,7 @@ import os
 import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-from preprocessing import load_and_preprocess_audio
+from preprocessing import load_and_preprocess_audio_enhanced as load_and_preprocess_audio
 from config import *
 
 
